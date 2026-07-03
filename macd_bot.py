@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-MACD AL/SAT Telegram Botu
-GitHub Actions ile her gün 18:10'da çalışır
-Pozisyonlar: pozisyonlar.csv (repo içinde saklanır)
+MACD AL/SAT Telegram Botu — Gün İçi Versiyon
+GitHub Actions: her 15 dakikada bir çalışır (10:00–18:00 BIST)
+
+- Açık pozisyonlar → ANLIK fiyatla her 15 dk kontrol edilir
+- AL sinyalleri    → sadece 17:45 sonrası (günlük mum kapanınca) aranır
 """
 
 import os, time, warnings
@@ -25,6 +27,7 @@ MAX_GUN   = 5
 EMA_AKTIF = True
 
 POZISYON_DOSYA = 'pozisyonlar.csv'
+TZ = pytz.timezone('Europe/Istanbul')
 
 HISSELER = [
     'ASELS', 'TUPRS', 'BIMAS', 'KTLEV', 'EREGL', 'ISDMR', 'GUBRF', 'SELEC',
@@ -55,8 +58,29 @@ def telegram_gonder(mesaj):
         print(f'⚠️ Telegram hatası: {e}')
         return False
 
-# ── VERİ & MACD ─────────────────────────────────────────────
-def veri_indir(ticker):
+# ── ANLİK FİYAT (gün içi kontrol için) ──────────────────────
+def anlik_fiyat_al(ticker):
+    """5 dakikalık mum → en son kapanış = anlık fiyat"""
+    try:
+        raw = yf.download(
+            ticker + '.IS',
+            period='1d',
+            interval='5m',
+            auto_adjust=True,
+            progress=False
+        )
+        if raw is None or raw.empty:
+            return None
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [c[0].lower() for c in raw.columns]
+        else:
+            raw.columns = [c.lower() for c in raw.columns]
+        return float(raw['close'].iloc[-1])
+    except:
+        return None
+
+# ── GÜNLÜK VERİ & MACD (AL sinyali için) ────────────────────
+def gunluk_veri_indir(ticker):
     try:
         raw = yf.download(ticker + '.IS', period='4mo', interval='1d',
                           auto_adjust=True, progress=False)
@@ -95,20 +119,16 @@ def al_sinyali_var(df):
         if pd.isna(e50) or df['close'].iloc[-1] < e50: return False
     return True
 
-def macd_negatife_dondu(df):
-    if len(df) < 2: return False
-    return df['hist'].iloc[-2] > 0 and df['hist'].iloc[-1] < 0
-
 # ── POZİSYON YÖNETİMİ ────────────────────────────────────────
 def pozisyon_yukle():
     if not os.path.exists(POZISYON_DOSYA):
-        return pd.DataFrame(columns=['ticker', 'giris_tarihi', 'alis_fiyat', 'gun_sayisi'])
+        return pd.DataFrame(columns=['ticker','giris_tarihi','alis_fiyat','gun_sayisi'])
     try:
         df = pd.read_csv(POZISYON_DOSYA)
         df['giris_tarihi'] = pd.to_datetime(df['giris_tarihi'])
         return df
     except:
-        return pd.DataFrame(columns=['ticker', 'giris_tarihi', 'alis_fiyat', 'gun_sayisi'])
+        return pd.DataFrame(columns=['ticker','giris_tarihi','alis_fiyat','gun_sayisi'])
 
 def pozisyon_kaydet(df):
     df.to_csv(POZISYON_DOSYA, index=False)
@@ -131,58 +151,82 @@ def pozisyon_sil(ticker):
     poz = poz[poz['ticker'] != ticker]
     pozisyon_kaydet(poz)
 
+def gun_sayisi_artir(ticker):
+    poz = pozisyon_yukle()
+    if ticker in poz['ticker'].values:
+        poz.loc[poz['ticker'] == ticker, 'gun_sayisi'] += 1
+        pozisyon_kaydet(poz)
+
 # ── ANA FONKSİYON ────────────────────────────────────────────
 def main():
-    tz    = pytz.timezone('Europe/Istanbul')
-    simdi = datetime.now(tz)
-    print(f'🔍 Tarama: {simdi.strftime("%d.%m.%Y %H:%M")} — {len(HISSELER)} hisse')
+    simdi     = datetime.now(TZ)
+    saat      = simdi.hour + simdi.minute / 60
+    saat_str  = simdi.strftime('%H:%M')
+    tarih_str = simdi.strftime('%d.%m.%Y %H:%M')
 
-    al_sinyaller  = []
+    # Kapanış zamanında gün sayısını artır (18:00–18:30 arası)
+    kapanista = 18.0 <= saat <= 18.5
+
+    print(f'⏱️  {tarih_str} | Piyasa saati: {saat_str}')
+    print(f'   Kapanış kontrolü: {"EVET" if kapanista else "hayır"}')
+
     sat_sinyaller = []
+    al_sinyaller  = []
+
     poz = pozisyon_yukle()
+    print(f'   Açık pozisyon: {len(poz)}')
 
-    for ticker in HISSELER:
-        df = veri_indir(ticker)
-        if df is None:
+    # ── 1) AÇIK POZİSYONLARI ANLİK FİYATLA KONTROL ET ──────
+    for _, row in poz.iterrows():
+        ticker     = row['ticker']
+        alis_fiyat = float(row['alis_fiyat'])
+        gun_sayisi = int(row['gun_sayisi'])
+
+        fiyat = anlik_fiyat_al(ticker)
+        if fiyat is None:
+            print(f'   ⚠️ {ticker} fiyat alınamadı, atlandı')
             continue
-        df = macd_hesapla(df)
-        simdiki_fiyat = float(df['close'].iloc[-1])
 
-        # ── SAT kontrol ──
-        if ticker in poz['ticker'].values:
-            row        = poz[poz['ticker'] == ticker].iloc[0]
-            alis_fiyat = float(row['alis_fiyat'])
-            gun_sayisi = int(row['gun_sayisi']) + 1
-            degisim    = (simdiki_fiyat - alis_fiyat) / alis_fiyat * 100
+        degisim = (fiyat - alis_fiyat) / alis_fiyat * 100
 
-            neden = None
-            if degisim >= KAR_PCT:
-                neden = f'✅ KAR HEDEFİ +{degisim:.2f}%'
-            elif degisim <= -STOP_PCT:
-                neden = f'🛑 STOP-LOSS {degisim:.2f}%'
-            elif gun_sayisi >= MAX_GUN:
-                neden = f'⏱️ {MAX_GUN} GÜN DOLDU ({degisim:+.2f}%)'
-            elif macd_negatife_dondu(df):
-                neden = f'📉 MACD NEGATİFE DÖNDÜ ({degisim:+.2f}%)'
+        neden = None
+        if degisim >= KAR_PCT:
+            neden = f'✅ KAR HEDEFİ +{degisim:.2f}%'
+        elif degisim <= -STOP_PCT:
+            neden = f'🛑 STOP-LOSS {degisim:.2f}%'
+        elif gun_sayisi >= MAX_GUN and kapanista:
+            neden = f'⏱️ {MAX_GUN} GÜN DOLDU ({degisim:+.2f}%)'
 
-            if neden:
-                sat_sinyaller.append((ticker, alis_fiyat, simdiki_fiyat, degisim, neden))
-                pozisyon_sil(ticker)
-                poz = pozisyon_yukle()
-            else:
-                poz.loc[poz['ticker'] == ticker, 'gun_sayisi'] = gun_sayisi
-                pozisyon_kaydet(poz)
-                poz = pozisyon_yukle()
+        if neden:
+            sat_sinyaller.append((ticker, alis_fiyat, fiyat, degisim, neden))
+            pozisyon_sil(ticker)
+            poz = pozisyon_yukle()
+        elif kapanista:
+            gun_sayisi_artir(ticker)
+            print(f'   📅 {ticker} gün sayısı → {gun_sayisi + 1}')
 
-        # ── AL kontrol ──
-        else:
+        time.sleep(0.3)
+
+    # ── 2) AL SİNYALİ → SADECE KAPANIŞTA (17:45+) ──────────
+    if saat >= 17.75:  # 17:45 ve sonrası
+        print(f'   🔍 AL sinyali taraması başlıyor...')
+        poz = pozisyon_yukle()  # SAT'lardan sonra yenile
+        for ticker in HISSELER:
+            if ticker in poz['ticker'].values:
+                continue  # Zaten pozisyon var
+            df = gunluk_veri_indir(ticker)
+            if df is None:
+                continue
+            df = macd_hesapla(df)
             if al_sinyali_var(df):
-                al_sinyaller.append((ticker, simdiki_fiyat, float(df['hist'].iloc[-1])))
-                pozisyon_ekle(ticker, simdiki_fiyat)
+                fiyat = float(df['close'].iloc[-1])
+                al_sinyaller.append((ticker, fiyat, float(df['hist'].iloc[-1])))
+                pozisyon_ekle(ticker, fiyat)
+            time.sleep(0.15)
 
-        time.sleep(0.15)
+    # ── TELEGRAM MESAJLARI ──────────────────────────────────
 
-    # ── SAT mesajları ──
+    # SAT mesajları (önce)
     for ticker, alis, simdiki, degisim, neden in sat_sinyaller:
         kl = '🟢' if degisim >= 0 else '🔴'
         mesaj = (
@@ -193,12 +237,12 @@ def main():
             f'Şimdiki : ₺{simdiki:.3f}\n'
             f'{kl} Değişim : %{degisim:+.2f}\n'
             f'━━━━━━━━━━━━━━━\n'
-            f'🕐 {simdi.strftime("%d.%m.%Y %H:%M")}'
+            f'🕐 {tarih_str}'
         )
         ok = telegram_gonder(mesaj)
         print(f'  🔴 SAT: {ticker} — {neden} → {"✅" if ok else "❌"}')
 
-    # ── AL mesajları ──
+    # AL mesajları
     if al_sinyaller:
         liste = ''
         for ticker, fiyat, hist in al_sinyaller:
@@ -209,14 +253,14 @@ def main():
             f'{liste}'
             f'━━━━━━━━━━━━━━━\n'
             f'Hedef: +{KAR_PCT}% | Stop: -{STOP_PCT}% | Max: {MAX_GUN}g\n'
-            f'⚡ AÇILIŞTA GİR\n'
-            f'🕐 {simdi.strftime("%d.%m.%Y %H:%M")}'
+            f'⚡ YARIN SABAH AÇILIŞTA GİR\n'
+            f'🕐 {tarih_str}'
         )
         ok = telegram_gonder(mesaj)
-        print(f'  🟢 AL: {len(al_sinyaller)} hisse → {"✅" if ok else "❌"}')
+        print(f'  🟢 AL: {len(al_sinyaller)} sinyal → {"✅" if ok else "❌"}')
 
     poz_son = pozisyon_yukle()
-    print(f'\n✅ Bitti | Açık: {len(poz_son)} | AL: {len(al_sinyaller)} | SAT: {len(sat_sinyaller)}')
+    print(f'\n✅ Bitti | Açık: {len(poz_son)} | SAT: {len(sat_sinyaller)} | AL: {len(al_sinyaller)}')
 
 if __name__ == '__main__':
     main()
